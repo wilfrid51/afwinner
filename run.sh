@@ -1,0 +1,1 @@
+torchrun --nproc_per_node=1 train_rl_multitask.py --global-batch-size 1

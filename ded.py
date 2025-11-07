@@ -164,5 +164,6 @@ class DEDTask:
 
         score = 1.0 if passed == total else 0.0
         logger.debug(f"DED evaluation completed with score: {score} ({passed}/{total})")
-        
+        print(f"[DED] Expected: {exp}, Got: {out}")
+
         return score

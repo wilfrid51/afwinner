@@ -195,5 +195,6 @@ class ABDTask:
         # Compare outputs
         ok = self.compare_outputs(expected_output, output)
         logger.debug(f"Evaluation score: {1.0 if ok else 0.0}")
+        print(f"[ABD] Expected: {expected_output}, Got: {output}")
 
         return 1.0 if ok else 0.0
