@@ -16,8 +16,9 @@ import math
 import random
 import argparse
 import asyncio
+import json
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -304,6 +305,164 @@ def compute_grpo_weights(
     return weights.detach()
 
 
+# ----------------- checkpoint save/load ----------------- #
+
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Find the latest checkpoint directory based on step number."""
+    if not os.path.exists(output_dir):
+        return None
+    
+    checkpoints = []
+    for item in os.listdir(output_dir):
+        if item.startswith("step-"):
+            try:
+                step = int(item.split("-")[1])
+                ckpt_path = os.path.join(output_dir, item)
+                if os.path.exists(os.path.join(ckpt_path, "training_state.pt")):
+                    checkpoints.append((step, ckpt_path))
+            except (ValueError, IndexError):
+                continue
+    
+    if not checkpoints:
+        return None
+    
+    # Sort by step number and return the latest
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    return checkpoints[0][1]
+
+
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    step: int,
+    ckpt_dir: str,
+    rank: int,
+):
+    """Save full training checkpoint including model, optimizer, scheduler, and step."""
+    if is_main(rank):
+        os.makedirs(ckpt_dir, exist_ok=True)
+        
+        # Save model (PEFT/LoRA will save adapter weights)
+        model.save_pretrained(ckpt_dir)
+        
+        # Save optimizer and scheduler state
+        torch.save(
+            {
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "step": step,
+            },
+            os.path.join(ckpt_dir, "training_state.pt"),
+        )
+        
+        # Save config/metadata
+        metadata = {
+            "step": step,
+            "checkpoint_dir": ckpt_dir,
+        }
+        with open(os.path.join(ckpt_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"[rank {rank}] Saved checkpoint at step {step} to {ckpt_dir}")
+
+
+def load_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    ckpt_dir: str,
+    device: torch.device,
+    rank: int,
+) -> int:
+    """
+    Load checkpoint and return the step number.
+    Returns step number if successful, 0 if checkpoint doesn't exist.
+    """
+    training_state_path = os.path.join(ckpt_dir, "training_state.pt")
+    metadata_path = os.path.join(ckpt_dir, "metadata.json")
+    
+    if not os.path.exists(training_state_path):
+        if is_main(rank):
+            print(f"[rank {rank}] No checkpoint found at {ckpt_dir}, starting from scratch")
+        return 0
+    
+    if is_main(rank):
+        print(f"[rank {rank}] Loading checkpoint from {ckpt_dir}")
+    
+    # Load model weights (PEFT/LoRA adapter weights)
+    try:
+        # Get the actual model (unwrap DDP if needed)
+        actual_model = model.module if hasattr(model, 'module') else model
+        
+        # Check if this is a PEFT checkpoint
+        if os.path.exists(os.path.join(ckpt_dir, "adapter_config.json")):
+            # Load PEFT adapter weights
+            if is_main(rank):
+                print(f"[rank {rank}] Loading PEFT adapter weights...")
+            
+            # Use PEFT's load_adapter method if available
+            if hasattr(actual_model, 'load_adapter'):
+                actual_model.load_adapter(ckpt_dir)
+            else:
+                # Fallback: load adapter weights manually
+                from peft import PeftModel
+                # Get base model
+                if hasattr(actual_model, 'get_base_model'):
+                    base_model = actual_model.get_base_model()
+                else:
+                    base_model = actual_model
+                # Load adapter
+                loaded_model = PeftModel.from_pretrained(base_model, ckpt_dir)
+                # Replace the model
+                if hasattr(model, 'module'):
+                    model.module = loaded_model
+                else:
+                    model = loaded_model
+        else:
+            # Regular PyTorch checkpoint (full model)
+            if is_main(rank):
+                print(f"[rank {rank}] Loading full model weights...")
+            checkpoint_path = os.path.join(ckpt_dir, "pytorch_model.bin")
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = os.path.join(ckpt_dir, "model.safetensors")
+            if os.path.exists(checkpoint_path):
+                # Try loading as state dict
+                try:
+                    state_dict = torch.load(checkpoint_path, map_location=device)
+                    actual_model.load_state_dict(state_dict, strict=False)
+                except:
+                    # If that fails, try using from_pretrained
+                    if hasattr(model, 'module'):
+                        model.module = AutoModelForCausalLM.from_pretrained(ckpt_dir)
+                    else:
+                        model = AutoModelForCausalLM.from_pretrained(ckpt_dir)
+    except Exception as e:
+        if is_main(rank):
+            print(f"[rank {rank}] Warning: Could not load model weights: {e}")
+            print(f"[rank {rank}] Continuing with existing model weights...")
+    
+    # Load optimizer and scheduler state
+    try:
+        checkpoint = torch.load(training_state_path, map_location=device)
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        step = checkpoint.get("step", 0)
+        
+        if is_main(rank):
+            print(f"[rank {rank}] Loaded checkpoint: step={step}")
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                    print(f"[rank {rank}] Checkpoint metadata: {metadata}")
+        
+        return step
+    except Exception as e:
+        if is_main(rank):
+            print(f"[rank {rank}] Error loading training state: {e}")
+        return 0
+
+
 # ----------------- async helpers for your tasks ----------------- #
 
 async def async_generate_challenges(tasks: List[object], task_ids: List[int]):
@@ -345,13 +504,19 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # ---- dtype ----
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # Force bfloat16 for memory reduction (saves ~50% memory vs float32)
+    dtype = torch.bfloat16
+    if not torch.cuda.is_bf16_supported():
+        if is_main(rank):
+            print(f"[rank {rank}] Warning: bfloat16 not supported, falling back to float16")
+        dtype = torch.float16
 
     # ---- base policy + reference (frozen) ----
     policy = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
         dtype=dtype,
         device_map=None,
+        torch_dtype=dtype,  # Explicitly set torch_dtype
     )
     # Load ref_policy on GPU with 8-bit quantization to save memory
     # This is much faster than CPU transfers and saves ~50% memory
@@ -374,14 +539,17 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         )
         ref_policy.to(device)
 
-    policy.to(device)
+    # Explicitly convert to bfloat16 to ensure all weights are in bfloat16
+    policy = policy.to(dtype=dtype).to(device)
+    
     ref_policy.eval()
     for p in ref_policy.parameters():
         p.requires_grad = False
 
     # ---- attach LoRA to policy only ----
     policy = add_lora(policy, cfg)
-    policy.to(device)
+    # Ensure LoRA adapters are also in bfloat16
+    policy = policy.to(dtype=dtype).to(device)
     
     # Enable cuDNN benchmarking for faster convolutions/RNNs (if any)
     torch.backends.cudnn.benchmark = True
@@ -415,6 +583,10 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         optimizer,
         T_max=cfg.total_steps,
     )
+    
+    # GradScaler for mixed precision training (bfloat16 forward, float32 backward)
+    # Note: bfloat16 doesn't need scaling, but GradScaler helps with stability
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))  # Only scale for float16
 
     # ---- your tasks + shared R2Dataset ----
     shared_dataset = R2Dataset(dataset_name=cfg.dataset_name)
@@ -434,8 +606,29 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         print(f"[rank {rank}] trainable params (LoRA only): "
               f"{sum(p.numel() for p in optim_params)}")
 
-    step = 0
+    # ----- load checkpoint if provided -----
+    start_step = 0
+    if hasattr(args, 'resume_from') and args.resume_from is not None:
+        # Load checkpoint (model, optimizer, scheduler)
+        start_step = load_checkpoint(
+            ddp_policy,  # Pass DDP model, function will handle .module
+            optimizer,
+            scheduler,
+            args.resume_from,
+            device,
+            rank,
+        )
+        # Sync step across all ranks for DDP
+        if world_size > 1:
+            step_tensor = torch.tensor([start_step], device=device)
+            dist.broadcast(step_tensor, src=0)
+            start_step = step_tensor.item()
+    
+    step = start_step
     ddp_policy.train()
+
+    if is_main(rank) and start_step > 0:
+        print(f"[rank {rank}] Resuming training from step {start_step}")
 
     while step < cfg.total_steps:
         # ----- 1) sample tasks + prompts (multi-task) -----
@@ -446,6 +639,7 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         prompts = [ch.prompt for ch in challenges]
 
         # ----- 2) rollout: generate responses from current policy -----
+        # Model is already in bfloat16, so generation will use bfloat16 automatically
         input_ids, attn_mask, prompt_lens, responses = generate_responses(
             ddp_policy.module,
             tokenizer,
@@ -465,15 +659,17 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         rewards = torch.tensor(scores, dtype=torch.float32, device=device)  # [B]
 
         # ----- 4) logprob_old and logprob_ref (no grad) -----
-        # Compute both in parallel for better GPU utilization
-        logprob_old = compute_logprobs_for_responses(
-            ddp_policy.module, input_ids, attn_mask, prompt_lens
-        ).to(device)
+        # Use autocast for inference to save memory
+        with torch.autocast(device_type='cuda', dtype=dtype, enabled=True):
+            # Compute both in parallel for better GPU utilization
+            logprob_old = compute_logprobs_for_responses(
+                ddp_policy.module, input_ids, attn_mask, prompt_lens
+            ).to(device)
 
-        # Reference policy is now on GPU, no CPU transfer needed
-        logprob_ref = compute_logprobs_for_responses(
-            ref_policy, input_ids, attn_mask, prompt_lens
-        ).to(device)
+            # Reference policy is now on GPU, no CPU transfer needed
+            logprob_ref = compute_logprobs_for_responses(
+                ref_policy, input_ids, attn_mask, prompt_lens
+            ).to(device)
 
         # ----- 5) GRPO weights -----
         weights = compute_grpo_weights(rewards, logprob_old, logprob_ref, cfg)  # [B]
@@ -482,9 +678,11 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         ddp_policy.train()
         optimizer.zero_grad(set_to_none=True)
 
-        # Do ONE forward pass (unavoidable for gradients), then process logits in tiny chunks
-        out = ddp_policy(input_ids=input_ids, attention_mask=attn_mask)
-        logits = out.logits  # [B, T, V] - this is the memory bottleneck
+        # Use autocast for mixed precision training (bfloat16 forward, float32 backward)
+        with torch.autocast(device_type='cuda', dtype=dtype, enabled=True):
+            # Do ONE forward pass (unavoidable for gradients), then process logits in tiny chunks
+            out = ddp_policy(input_ids=input_ids, attention_mask=attn_mask)
+            logits = out.logits  # [B, T, V] - this is the memory bottleneck
         
         B, T, V = logits.shape
         target_ids = input_ids[:, 1:]  # [B, T-1]
@@ -533,9 +731,12 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         avg_logprob_new = -resp_logprob_sum / resp_len  # [B]
         loss = -(weights * avg_logprob_new).mean()
         
-        loss.backward()
+        # Use scaler for mixed precision backward pass
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(optim_params, 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
         
         # Cleanup (only clear cache once per step, not multiple times)
@@ -563,8 +764,14 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         # ----- checkpoint -----
         if is_main(rank) and step % cfg.save_every == 0:
             ckpt_dir = os.path.join(cfg.output_dir, f"step-{step}")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ddp_policy.module.save_pretrained(ckpt_dir)
+            save_checkpoint(
+                ddp_policy.module,
+                optimizer,
+                scheduler,
+                step,
+                ckpt_dir,
+                rank,
+            )
 
 
 # ----------------- entrypoint ----------------- #
@@ -597,6 +804,13 @@ def parse_args():
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume training from. "
+              "If 'auto', will automatically find the latest checkpoint in output_dir.",
+    )
     return parser.parse_args()
 
 
@@ -615,6 +829,16 @@ def main():
         cfg.lr = args.lr
     if args.seed is not None:
         cfg.seed = args.seed
+    
+    # Handle auto-resume
+    if args.resume_from == "auto":
+        latest_ckpt = find_latest_checkpoint(cfg.output_dir)
+        if latest_ckpt:
+            args.resume_from = latest_ckpt
+            print(f"Auto-resuming from latest checkpoint: {latest_ckpt}")
+        else:
+            args.resume_from = None
+            print("No checkpoint found for auto-resume, starting from scratch")
 
     rank, world_size, local_rank = setup_ddp()
     set_seed(cfg.seed, rank)
