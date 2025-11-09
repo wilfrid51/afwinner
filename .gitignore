@@ -10,4 +10,4 @@ venv/
 .vscode/
 *.log
 .dockerignore
- 
+__pycache__/
