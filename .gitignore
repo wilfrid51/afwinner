@@ -11,3 +11,4 @@ venv/
 *.log
 .dockerignore
 __pycache__/
+rl_lora_ckpts/
