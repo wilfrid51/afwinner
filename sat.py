@@ -47,12 +47,15 @@ class SATTask:
     async def evaluate(self, response: str, challenge: Challenge) -> float:
         """Evaluate SAT response"""
         cls = challenge.extra.get("clauses", [])
-        
+
+        print("[SAT Evaluating...]")
+
         got = {
             int(v): val.lower() in ("true", "1")
             for v, val in re.findall(r"x(\d+)=(True|False|1|0)", response or "")
         }
         
         ok = all(any((lit > 0) == got.get(abs(lit), None) for lit in c) for c in cls)
-        print(f"[SAT] Got: {got}, Expected: {challenge.extra.get('solution', {})}")
+        # print(f"[SAT] Got: {got}, Expected: {challenge.extra.get('solution', {})}")
+        print(f"[SAT SCORE] {float(ok)} ({ok})")
         return float(ok)

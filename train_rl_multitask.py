@@ -19,6 +19,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple, Optional
+from threading import Lock
 
 import torch
 import torch.nn.functional as F
@@ -40,10 +41,11 @@ from dataset import R2Dataset
 @dataclass
 class RLConfig:
     # ---- model / generation ----
-    model_name_or_path: str = "EpistemeAI/ReasoningCore-1B-r1-0"  # <<< SET THIS
+    model_name_or_path: str = "5Fafur/Affine-grab"  # <<< SET THIS
+    # model_name_or_path: str = "NickDegollado0714/Affine-v5"  # <<< SET THIS
     # model_name_or_path: str = "trongg/Affine_robertoCalories"  # <<< SET THIS
-    max_prompt_len: int = 512
-    max_new_tokens: int = 256
+    max_prompt_len: int = 2048
+    max_new_tokens: int = 2048
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 0
@@ -67,13 +69,20 @@ class RLConfig:
     # ---- data ----
     dataset_name: str = "satpalsr/rl-python"  # same as env.py
 
+    # ---- streaming tasks ----
+    enable_streaming_tasks: bool = True  # Enable dynamic task addition
+    initial_task_count: int = 64  # Start with 64 tasks (8 GPUs × 8 batch = 64 samples per step)
+    max_tasks: int = 200  # Maximum number of tasks to allow (allows streaming to add more)
+    add_task_interval_steps: int = 50  # Add new task every N steps
+    streaming_task_types: List[str] = None  # None = auto-detect from available types
+
     # ---- logging / ckpt ----
     log_every: int = 10
-    save_every: int = 1000
+    save_every: int = 200
     output_dir: str = "./rl_lora_ckpts"
 
     # ---- misc ----
-    seed: int = 42
+    seed: int = 23
 
 
 # ----------------- DDP utils ----------------- #
@@ -89,14 +98,19 @@ def setup_ddp():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
 
-    dist.init_process_group(backend="nccl")
+    # Set device before init_process_group to avoid device context warnings
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
 
     return rank, world_size, local_rank
 
 
-def cleanup_ddp():
+def cleanup_ddp(local_rank: int = None):
+    """Clean up DDP, ensuring device is set before barrier to avoid warnings."""
     if dist.is_initialized():
+        # Ensure device is set before barrier to avoid device context warnings
+        if local_rank is not None:
+            torch.cuda.set_device(local_rank)
         dist.barrier()
         dist.destroy_process_group()
 
@@ -159,6 +173,10 @@ def compute_logprobs_for_responses(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     prompt_lengths: torch.Tensor,
+    model_name: str = "model",
+    rank: int = 0,
+    log_every: int = 10,
+    step: int = 0,
 ) -> torch.Tensor:
     """
     Compute average logprob over *response* tokens for each sample.
@@ -168,19 +186,32 @@ def compute_logprobs_for_responses(
     attention_mask: [B, T]
     prompt_lengths: [B] (token length of the prompt *before* generation)
     """
+    if rank == 0 and step % log_every == 0:
+        print(f"[rank {rank}] [{model_name}] Starting forward pass (seq_len: {input_ids.shape[1]}, batch: {input_ids.shape[0]})...")
+    
     with torch.no_grad():
+        if rank == 0 and step % log_every == 0:
+            print(f"[rank {rank}] [{model_name}] Calling model.forward()...")
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = out.logits  # [B, T, V]
         del out  # Free memory immediately
         torch.cuda.empty_cache()
+        if rank == 0 and step % log_every == 0:
+            print(f"[rank {rank}] [{model_name}] Forward pass completed, processing logits...")
 
     # Process in chunks to avoid large log_softmax tensor
     B, T, V = logits.shape
     target_ids = input_ids[:, 1:]  # [B, T-1]
     chunk_size = 32  # Process 32 tokens at a time
+    num_chunks = (T - 1 + chunk_size - 1) // chunk_size
+    
+    if rank == 0 and step % log_every == 0:
+        print(f"[rank {rank}] [{model_name}] Processing {num_chunks} chunks (seq_len: {T})...")
     
     token_logprobs_list = []
-    for i in range(0, T - 1, chunk_size):
+    for chunk_idx, i in enumerate(range(0, T - 1, chunk_size)):
+        if rank == 0 and step % log_every == 0 and chunk_idx % 40 == 0:
+            print(f"[rank {rank}] [{model_name}] Processing chunk {chunk_idx+1}/{num_chunks}...")
         end_idx = min(i + chunk_size, T - 1)
         logits_chunk = logits[:, i:end_idx+1, :]  # [B, chunk, V]
         target_chunk = target_ids[:, i:end_idx]  # [B, chunk]
@@ -212,6 +243,7 @@ def compute_logprobs_for_responses(
     resp_len = resp_mask.sum(dim=1).clamp(min=1.0)              # [B]
 
     avg_logprob = resp_logprob_sum / resp_len
+
     return avg_logprob
 
 
@@ -465,30 +497,247 @@ def load_checkpoint(
         return 0
 
 
+# ----------------- streaming task manager ----------------- #
+
+class StreamingTaskManager:
+    """
+    Manages a dynamic list of tasks that can grow during training.
+    Thread-safe and supports async task loading.
+    """
+    def __init__(self, initial_tasks: List[object], task_names: List[str], 
+                 max_tasks: int = 20, rank: int = 0):
+        self._tasks: List[object] = list(initial_tasks)
+        self._task_names: List[str] = list(task_names)
+        self._lock = Lock()
+        self._max_tasks = max_tasks
+        self._rank = rank
+        self._task_counter = len(initial_tasks)
+        
+    def get_task_count(self) -> int:
+        """Get current number of tasks (thread-safe)."""
+        with self._lock:
+            return len(self._tasks)
+    
+    def get_tasks(self) -> List[object]:
+        """Get current task list (thread-safe copy)."""
+        with self._lock:
+            return list(self._tasks)
+    
+    def get_task_names(self) -> List[str]:
+        """Get current task names (thread-safe copy)."""
+        with self._lock:
+            return list(self._task_names)
+    
+    def sample_task_ids(self, batch_size: int) -> List[int]:
+        """Sample random task IDs (thread-safe)."""
+        with self._lock:
+            num_tasks = len(self._tasks)
+            if num_tasks == 0:
+                return [0] * batch_size
+            return [random.randrange(num_tasks) for _ in range(batch_size)]
+    
+    def add_task(self, task: object, task_name: str) -> bool:
+        """
+        Add a new task (thread-safe).
+        Returns True if added, False if max_tasks reached.
+        """
+        with self._lock:
+            if len(self._tasks) >= self._max_tasks:
+                if self._rank == 0:
+                    print(f"[TaskManager] Max tasks ({self._max_tasks}) reached, skipping new task")
+                return False
+            self._tasks.append(task)
+            self._task_names.append(task_name)
+            self._task_counter += 1
+            if self._rank == 0:
+                print(f"[TaskManager] Added task #{self._task_counter}: {task_name} (total: {len(self._tasks)})")
+            return True
+    
+    def can_add_more(self) -> bool:
+        """Check if more tasks can be added."""
+        with self._lock:
+            return len(self._tasks) < self._max_tasks
+
+
+async def create_streaming_tasks(
+    shared_dataset: R2Dataset,
+    cfg: RLConfig,
+    rank: int,
+    world_size: int = 8,
+) -> StreamingTaskManager:
+    """
+    Create initial tasks and set up streaming task manager.
+    Creates enough tasks to ensure each sample in a batch comes from a unique task.
+    """
+    # Create initial tasks
+    initial_tasks = []
+    initial_names = []
+    
+    # Calculate required tasks based on actual batch size
+    # Each GPU processes per_device_batch samples
+    per_device_batch = max(1, cfg.global_batch_size // world_size)
+    # Total samples per step = world_size * per_device_batch
+    total_samples_per_step = world_size * per_device_batch
+    
+    # We need at least total_samples_per_step tasks to ensure each sample comes from a unique task
+    # Use max of: initial_task_count, total_samples_per_step, or world_size (minimum)
+    target_count = max(cfg.initial_task_count, total_samples_per_step, world_size)
+    
+    if rank == 0:
+        print(f"[TaskManager] Creating {target_count} initial tasks")
+        print(f"[TaskManager]   - world_size: {world_size}")
+        print(f"[TaskManager]   - global_batch_size: {cfg.global_batch_size}")
+        print(f"[TaskManager]   - per_device_batch: {per_device_batch}")
+        print(f"[TaskManager]   - total_samples_per_step: {total_samples_per_step}")
+        print(f"[TaskManager]   - target_task_count: {target_count}")
+    
+    # Task type rotation: SAT, ABD, DED
+    task_types = ["sat", "abd", "ded"]
+    
+    # Create multiple instances of each task type
+    for i in range(target_count):
+        task_type = task_types[i % len(task_types)]
+        task_num = i // len(task_types) + 1  # Which instance of this type
+        
+        if task_type == "sat":
+            initial_tasks.append(SATTask())
+            initial_names.append(f"sat_v{task_num}")
+        elif task_type == "abd":
+            initial_tasks.append(ABDTask(dataset=shared_dataset))
+            initial_names.append(f"abd_v{task_num}")
+        elif task_type == "ded":
+            initial_tasks.append(DEDTask(dataset=shared_dataset))
+            initial_names.append(f"ded_v{task_num}")
+    
+    manager = StreamingTaskManager(
+        initial_tasks=initial_tasks,
+        task_names=initial_names,
+        max_tasks=cfg.max_tasks,
+        rank=rank,
+    )
+    
+    if rank == 0:
+        print(f"[TaskManager] Initialized with {len(initial_tasks)} tasks: {initial_names}")
+        print(f"[TaskManager] Task distribution: {target_count} tasks for {world_size} GPUs")
+    
+    return manager
+
+
+async def background_task_loader(
+    manager: StreamingTaskManager,
+    shared_dataset: R2Dataset,
+    cfg: RLConfig,
+    rank: int,
+    step_counter,
+):
+    """
+    Background coroutine that adds new tasks periodically.
+    Runs asynchronously without blocking training.
+    """
+    if not cfg.enable_streaming_tasks:
+        return
+    
+    last_step = 0
+    task_type_rotation = ["abd", "ded"]  # Rotate between ABD and DED variants
+    task_type_idx = 0  # Track which task type to add next
+    
+    if rank == 0:
+        print(f"[TaskManager] Background loader started, will add tasks every {cfg.add_task_interval_steps} steps")
+    
+    while True:
+        # Wait for next step interval
+        await asyncio.sleep(0.5)  # Check every 0.5 seconds for more responsive updates
+        
+        # Get current step (approximate)
+        current_step = getattr(step_counter, 'value', 0)
+        
+        # Check if it's time to add a new task
+        if current_step > last_step and (current_step - last_step) >= cfg.add_task_interval_steps:
+            if manager.can_add_more():
+                # Add a new task variant
+                task_type = task_type_rotation[task_type_idx % len(task_type_rotation)]
+                task_type_idx += 1
+                
+                try:
+                    current_count = manager.get_task_count()
+                    if task_type == "abd":
+                        new_task = ABDTask(dataset=shared_dataset)
+                        task_name = f"abd_v{current_count + 1}"
+                    elif task_type == "ded":
+                        new_task = DEDTask(dataset=shared_dataset)
+                        task_name = f"ded_v{current_count + 1}"
+                    else:
+                        # Default to SAT if unknown
+                        new_task = SATTask()
+                        task_name = f"sat_v{current_count + 1}"
+                    
+                    success = manager.add_task(new_task, task_name)
+                    if success:
+                        last_step = current_step
+                        if rank == 0:
+                            print(f"[TaskManager] Added task at step {current_step}: {task_name} (total: {manager.get_task_count()}/{cfg.max_tasks})")
+                except Exception as e:
+                    if rank == 0:
+                        print(f"[TaskManager] Error adding task at step {current_step}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            else:
+                # Can't add more - already at max
+                if rank == 0 and current_step % (cfg.add_task_interval_steps * 10) == 0:
+                    print(f"[TaskManager] At max tasks ({manager.get_task_count()}/{cfg.max_tasks}), cannot add more")
+
+
 # ----------------- async helpers for your tasks ----------------- #
 
-async def async_generate_challenges(tasks: List[object], task_ids: List[int]):
+async def async_generate_challenges(manager: StreamingTaskManager, task_ids: List[int]):
     """Run task.generate() concurrently for a batch."""
+    tasks = manager.get_tasks()
     coros = [tasks[t_idx].generate() for t_idx in task_ids]
     return await asyncio.gather(*coros)
 
 
 async def async_evaluate_challenges(
-    tasks: List[object],
+    manager: StreamingTaskManager,
     task_ids: List[int],
     responses: List[str],
     challenges: List[object],
+    timeout_per_task: float = 120.0,  # 2 minutes per task (allows for multiple test cases)
 ):
-    """Run task.evaluate() concurrently for a batch."""
+    """
+    Run task.evaluate() concurrently for a batch.
+    Each evaluation has a timeout to prevent hanging.
+    """
+    tasks = manager.get_tasks()
+    
+    async def evaluate_with_timeout(task_idx: int, resp: str, ch: object) -> float:
+        """Evaluate a single task with timeout protection."""
+        try:
+            # Add timeout to prevent hanging (especially for DED tasks with many test cases)
+            result = await asyncio.wait_for(
+                tasks[task_idx].evaluate(resp, ch),
+                timeout=timeout_per_task
+            )
+            return float(result)
+        except asyncio.TimeoutError:
+            print(f"[WARNING] Task evaluation timed out after {timeout_per_task}s, returning 0.0")
+            return 0.0
+        except Exception as e:
+            print(f"[WARNING] Task evaluation failed: {e}, returning 0.0")
+            return 0.0
+    
+    # Create coroutines with timeout protection
     coros = [
-        tasks[t_idx].evaluate(resp, ch)
+        evaluate_with_timeout(t_idx, resp, ch)
         for t_idx, resp, ch in zip(task_ids, responses, challenges)
     ]
+    
+    # Gather all results (each already has timeout protection)
     results = await asyncio.gather(*coros, return_exceptions=True)
     scores: List[float] = []
     for r in results:
         if isinstance(r, Exception):
             # If task crashes, just give 0 reward
+            print(f"[WARNING] Task evaluation raised exception: {r}, returning 0.0")
             scores.append(0.0)
         else:
             scores.append(float(r))
@@ -504,6 +753,8 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Set left padding for decoder-only models
+    tokenizer.padding_side = 'left'
 
     # ---- dtype ----
     # Force bfloat16 for memory reduction (saves ~50% memory vs float32)
@@ -514,18 +765,24 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         dtype = torch.float16
 
     # ---- base policy + reference (frozen) ----
+    if is_main(rank):
+        print(f"[rank {rank}] Loading policy model: {cfg.model_name_or_path}")
     policy = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
         dtype=dtype,
         device_map=None,
-        torch_dtype=dtype,  # Explicitly set torch_dtype
+        # torch_dtype=dtype,  # Explicitly set torch_dtype
     )
+    if is_main(rank):
+        print(f"[rank {rank}] Policy model loaded, loading reference model...")
     # Load ref_policy on CPU to save GPU memory
     ref_policy = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
         dtype=dtype,
         device_map=None,
     )
+    if is_main(rank):
+        print(f"[rank {rank}] Reference model loaded")
 
     # Explicitly convert to bfloat16 to ensure all weights are in bfloat16
     policy = policy.to(dtype=dtype).to(device)
@@ -563,17 +820,27 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
     
     # GradScaler for mixed precision training (bfloat16 forward, float32 backward)
     # Note: bfloat16 doesn't need scaling, but GradScaler helps with stability
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))  # Only scale for float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))  # Only scale for float16
 
     # ---- your tasks + shared R2Dataset ----
+    if is_main(rank):
+        print(f"[rank {rank}] Initializing dataset: {cfg.dataset_name}")
     shared_dataset = R2Dataset(dataset_name=cfg.dataset_name)
-    tasks: List[object] = [
-        SATTask(),                      # no dataset needed
-        ABDTask(dataset=shared_dataset),
-        DEDTask(dataset=shared_dataset),
-    ]
-    task_names = ["sat", "abd", "ded"]
-    num_tasks = len(tasks)
+    if is_main(rank):
+        print(f"[rank {rank}] Dataset initialized, creating streaming task manager...")
+    
+    # Create streaming task manager
+    task_manager = await create_streaming_tasks(shared_dataset, cfg, rank, world_size)
+    if is_main(rank):
+        print(f"[rank {rank}] Task manager created, starting training loop...")
+    
+    # Set up background task loader (only on main rank to avoid duplicates)
+    step_counter = type('StepCounter', (), {'value': 0})()  # Simple step tracker
+    if is_main(rank) and cfg.enable_streaming_tasks:
+        asyncio.create_task(background_task_loader(
+            task_manager, shared_dataset, cfg, rank, step_counter
+        ))
+        print(f"[rank {rank}] Background task loader started (will add tasks every {cfg.add_task_interval_steps} steps)")
 
     per_device_batch = max(1, cfg.global_batch_size // world_size)
 
@@ -607,12 +874,23 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
     if is_main(rank) and start_step > 0:
         print(f"[rank {rank}] Resuming training from step {start_step}")
 
+    if is_main(rank):
+        print(f"[rank {rank}] Starting training loop... STEP = {step}, TOTAL_STEPS = {cfg.total_steps}")
     while step < cfg.total_steps:
+        # Update step counter for background task loader (all ranks update it)
+        step_counter.value = step
+        
         # ----- 1) sample tasks + prompts (multi-task) -----
-        chosen_task_ids = [random.randrange(num_tasks) for _ in range(per_device_batch)]
+        # Use task manager to get current task count and sample
+        num_tasks = task_manager.get_task_count()
+        chosen_task_ids = task_manager.sample_task_ids(per_device_batch)
+        
+        if step % cfg.log_every == 0 and is_main(rank):
+            task_names = task_manager.get_task_names()
+            print(f"[rank {rank}] Step {step}: Using {num_tasks} tasks: {task_names}")
 
         # async generate challenges from your envs
-        challenges = await async_generate_challenges(tasks, chosen_task_ids)
+        challenges = await async_generate_challenges(task_manager, chosen_task_ids)
         prompts = [ch.prompt for ch in challenges]
 
         # ----- 2) rollout: generate responses from current policy -----
@@ -626,43 +904,122 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         torch.cuda.empty_cache()  # Clear cache after generation
 
         # ----- 3) compute rewards via your task evaluators -----
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Starting evaluation of {len(responses)} responses...")
         scores = await async_evaluate_challenges(
-            tasks,
+            task_manager,
             chosen_task_ids,
             responses,
             challenges,
+            timeout_per_task=120.0,  # 2 minutes per task (allows for DED with many test cases)
         )
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Evaluation completed, scores: {scores}")
         rewards = torch.tensor(scores, dtype=torch.float32, device=device)  # [B]
+        
+        # CRITICAL: Synchronize all ranks before logprob computation
+        # This ensures all evaluation is complete and GPU resources are freed
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Synchronizing all ranks before logprob computation...")
+        dist.barrier()  # Wait for all ranks to finish evaluation
+        torch.cuda.empty_cache()  # Clear GPU cache after synchronization
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] All ranks synchronized, starting logprob computation...")
 
         # ----- 4) logprob_old and logprob_ref (no grad) -----
         # Use autocast for inference to save memory
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Computing logprobs (seq_len: {input_ids.shape[1]})...")
+        
         with torch.autocast(device_type='cuda', dtype=dtype, enabled=True):
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] Computing logprob_old (policy)...")
             logprob_old = compute_logprobs_for_responses(
-                ddp_policy.module, input_ids, attn_mask, prompt_lens
+                ddp_policy.module, input_ids, attn_mask, prompt_lens,
+                model_name="policy", rank=rank, log_every=cfg.log_every, step=step
             ).to(device)
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] logprob_old completed, computing logprob_ref...")
 
-            # Compute ref logprobs on CPU, then move to GPU
-            input_ids_cpu = input_ids.cpu()
-            attn_mask_cpu = attn_mask.cpu()
-            prompt_lens_cpu = prompt_lens.cpu()
+            # CRITICAL FIX: Compute ref logprobs on GPU temporarily (CPU is too slow for long sequences)
+            # Move ref_policy to GPU, compute, then move back to CPU
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] Moving ref_policy to GPU...")
+                if torch.cuda.is_available():
+                    mem_before = torch.cuda.memory_allocated(device) / 1e9
+                    print(f"[rank {rank}] GPU memory before moving ref_policy: {mem_before:.2f} GB")
+            
+            # Check available memory before moving ref_policy
+            if torch.cuda.is_available():
+                free_mem = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+                free_mem_gb = free_mem / 1e9
+                if is_main(rank) and step % cfg.log_every == 0:
+                    print(f"[rank {rank}] Available GPU memory: {free_mem_gb:.2f} GB")
+                # Rough estimate: ref_policy needs ~model_size * 2 (for activations)
+                # If less than 2GB free, might be tight
+                if free_mem_gb < 2.0:
+                    if is_main(rank):
+                        print(f"[rank {rank}] WARNING: Low GPU memory ({free_mem_gb:.2f} GB), ref_policy forward might be slow")
+            
+            ref_policy.to(device)
+            torch.cuda.empty_cache()  # Clear cache after moving model
+            
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] Computing logprob_ref (reference policy)...")
+                if torch.cuda.is_available():
+                    mem_after = torch.cuda.memory_allocated(device) / 1e9
+                    print(f"[rank {rank}] GPU memory after moving ref_policy: {mem_after:.2f} GB")
+            
             logprob_ref = compute_logprobs_for_responses(
-                ref_policy, input_ids_cpu, attn_mask_cpu, prompt_lens_cpu
-            ).to(device)
-            del input_ids_cpu, attn_mask_cpu, prompt_lens_cpu
+                ref_policy, input_ids, attn_mask, prompt_lens,
+                model_name="ref_policy", rank=rank, log_every=cfg.log_every, step=step
+            )
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] logprob_ref completed, moving ref_policy back to CPU...")
+            ref_policy.to("cpu")  # Move back to CPU to free GPU memory
+            torch.cuda.empty_cache()
         torch.cuda.empty_cache()
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] All logprobs computed successfully")
 
         # ----- 5) GRPO weights -----
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Computing GRPO weights...")
         weights = compute_grpo_weights(rewards, logprob_old, logprob_ref, cfg)  # [B]
 
         # ----- 6) training step (recompute logprobs with grad) -----
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Starting training step (forward pass)...")
         ddp_policy.train()
         optimizer.zero_grad(set_to_none=True)
 
         # Use autocast for mixed precision training (bfloat16 forward, float32 backward)
-        with torch.autocast(device_type='cuda', dtype=dtype, enabled=True):
-            # Do ONE forward pass (unavoidable for gradients), then process logits in tiny chunks
-            out = ddp_policy(input_ids=input_ids, attention_mask=attn_mask)
-            logits = out.logits  # [B, T, V] - this is the memory bottleneck
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Forward pass through DDP model (seq_len: {input_ids.shape[1]}, batch: {input_ids.shape[0]})...")
+            if torch.cuda.is_available():
+                print(f"[rank {rank}] GPU memory before forward: {torch.cuda.memory_allocated(device)/1e9:.2f} GB / {torch.cuda.max_memory_allocated(device)/1e9:.2f} GB max")
+        
+        try:
+            with torch.autocast(device_type='cuda', dtype=dtype, enabled=True):
+                # Do ONE forward pass (unavoidable for gradients), then process logits in tiny chunks
+                out = ddp_policy(input_ids=input_ids, attention_mask=attn_mask)
+                logits = out.logits  # [B, T, V] - this is the memory bottleneck
+            if is_main(rank) and step % cfg.log_every == 0:
+                print(f"[rank {rank}] Forward pass completed, logits shape: {logits.shape}")
+                if torch.cuda.is_available():
+                    print(f"[rank {rank}] GPU memory after forward: {torch.cuda.memory_allocated(device)/1e9:.2f} GB / {torch.cuda.max_memory_allocated(device)/1e9:.2f} GB max")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if is_main(rank):
+                    print(f"[rank {rank}] ERROR: GPU out of memory during forward pass!")
+                    print(f"[rank {rank}] Sequence length: {input_ids.shape[1]}, Batch size: {input_ids.shape[0]}")
+                    print(f"[rank {rank}] Try reducing max_prompt_len or max_new_tokens, or reducing batch_size")
+                torch.cuda.empty_cache()
+                raise
+            else:
+                if is_main(rank):
+                    print(f"[rank {rank}] ERROR during forward pass: {e}")
+                raise
         
         B, T, V = logits.shape
         target_ids = input_ids[:, 1:]  # [B, T-1]
@@ -674,12 +1031,19 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         resp_mask = (idxs >= start).float() * attn_mask[:, 1:].float()  # [B, T-1]
         resp_len = resp_mask.sum(dim=1).clamp(min=1.0)  # [B]
         
-        # Process logits in VERY small chunks (4 tokens at a time) to minimize peak memory
+        # Process logits in chunks to minimize peak memory
+        # Increased chunk_size from 4 to 32 for better performance (was too slow)
         # Use cross_entropy which is more memory efficient than log_softmax + gather
-        chunk_size = 4
+        chunk_size = 32
         resp_logprob_sum = None
+        num_chunks = (T - 1 + chunk_size - 1) // chunk_size
         
-        for i in range(0, T - 1, chunk_size):
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Processing training step (sequence length: {T}, chunks: {num_chunks})...")
+        
+        for chunk_idx, i in enumerate(range(0, T - 1, chunk_size)):
+            if is_main(rank) and step % cfg.log_every == 0 and chunk_idx % 20 == 0:
+                print(f"[rank {rank}] Processing chunk {chunk_idx+1}/{num_chunks}...")
             end_idx = min(i + chunk_size, T - 1)
             chunk_len = end_idx - i
             
@@ -709,17 +1073,25 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
             torch.cuda.empty_cache()
         
         # Convert NLL to logprob (negate)
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Computing loss and backward pass...")
         avg_logprob_new = -resp_logprob_sum / resp_len  # [B]
         loss = -(weights * avg_logprob_new).mean()
         
         # Use scaler for mixed precision backward pass
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Calling backward()...")
         scaler.scale(loss).backward()
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Backward completed, updating optimizer...")
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(optim_params, 1.0)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
-        
+        if is_main(rank) and step % cfg.log_every == 0:
+            print(f"[rank {rank}] Optimizer step completed")
+
         # Cleanup
         del out, logits, resp_logprob_sum, resp_mask, resp_len
         torch.cuda.empty_cache()
@@ -828,7 +1200,7 @@ def main():
     try:
         asyncio.run(train(rank, world_size, local_rank, cfg, args))
     finally:
-        cleanup_ddp()
+        cleanup_ddp(local_rank)
 
 
 if __name__ == "__main__":

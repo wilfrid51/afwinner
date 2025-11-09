@@ -159,6 +159,7 @@ class ABDTask:
     async def evaluate(self, response: str, challenge: Challenge) -> float:
         """Evaluate if the provided input produces the expected output"""
         logger.debug("Evaluating ABD response")
+        print("[ABD Evaluating...]")
 
         program = challenge.extra.get("program", "")
         expected_output = challenge.extra.get("expected_output", "")
@@ -194,7 +195,8 @@ class ABDTask:
 
         # Compare outputs
         ok = self.compare_outputs(expected_output, output)
-        logger.debug(f"Evaluation score: {1.0 if ok else 0.0}")
-        print(f"[ABD] Expected: {expected_output}, Got: {output}")
+        logger.debug(f"Evaluation score: {float(ok)} ({ok})")
+        # print(f"[ABD] Expected: {expected_output}, Got: {output}")
+        print(f"[ABD SCORE] {float(ok)} ({ok})")
 
         return 1.0 if ok else 0.0

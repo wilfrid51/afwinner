@@ -40,7 +40,7 @@ from dataset import R2Dataset
 @dataclass
 class RLConfig:
     # ---- model / generation ----
-    model_name_or_path: str = "EpistemeAI/ReasoningCore-1B-r1-0"  # <<< SET THIS
+    model_name_or_path: str = "5Fafur/Affine-grab"  # <<< SET THIS
     # model_name_or_path: str = "trongg/Affine_robertoCalories"  # <<< SET THIS
     max_prompt_len: int = 512
     max_new_tokens: int = 256
@@ -502,6 +502,8 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    # Set left padding for decoder-only models
+    tokenizer.padding_side = 'left'
 
     # ---- dtype ----
     # Force bfloat16 for memory reduction (saves ~50% memory vs float32)
@@ -516,7 +518,7 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
         cfg.model_name_or_path,
         dtype=dtype,
         device_map=None,
-        torch_dtype=dtype,  # Explicitly set torch_dtype
+        # torch_dtype=dtype,  # Explicitly set torch_dtype
     )
     # Load ref_policy on GPU with 8-bit quantization to save memory
     # This is much faster than CPU transfers and saves ~50% memory
@@ -586,7 +588,7 @@ async def train(rank: int, world_size: int, local_rank: int, cfg: RLConfig, args
     
     # GradScaler for mixed precision training (bfloat16 forward, float32 backward)
     # Note: bfloat16 doesn't need scaling, but GradScaler helps with stability
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))  # Only scale for float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))  # Only scale for float16
 
     # ---- your tasks + shared R2Dataset ----
     shared_dataset = R2Dataset(dataset_name=cfg.dataset_name)
