@@ -2,7 +2,7 @@
 
 import random
 import re
-from models import Challenge
+from .models import Challenge
 
 
 class SATTask:

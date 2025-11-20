@@ -11,3 +11,6 @@ venv/
 *.log
 .dockerignore
 __pycache__/
+
+AL/output/
+AL/replay/

@@ -5,3 +5,8 @@ certifi
 aiobotocore
 aiohttp
 botocore
+
+torch
+transformers
+accelerate
+peft

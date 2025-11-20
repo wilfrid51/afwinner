@@ -4,9 +4,9 @@ import json
 import asyncio
 import logging
 from typing import Any, Dict
-from executor import ProgramExecutor
-from dataset import R2Dataset
-from models import Challenge
+from .executor import ProgramExecutor
+from .dataset import R2Dataset
+from .models import Challenge
 
 # Logger
 logger = logging.getLogger("affine")
