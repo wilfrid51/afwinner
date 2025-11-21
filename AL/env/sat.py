@@ -56,6 +56,5 @@ class SATTask:
         }
         
         ok = all(any((lit > 0) == got.get(abs(lit), None) for lit in c) for c in cls)
-        # print(f"[SAT] Got: {got}, Expected: {challenge.extra.get('solution', {})}")
         # print(f"[SAT SCORE] {float(ok)} ({ok})")
         return float(ok)

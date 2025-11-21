@@ -5,4 +5,5 @@ CUDA_VISIBLE_DEVICES=0 python learner.py \
   --batch_groups 2 \
   --group_size 4 \
   --bf16 \
+#   --resume_dir output \
   --max_seq_len 1600

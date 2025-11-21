@@ -8,6 +8,7 @@ import asyncio
 import random
 import logging
 import itertools
+import gc
 from typing import List, Tuple
 
 import torch
@@ -262,37 +263,142 @@ def maybe_reload_model(model, tokenizer, args, device, last_reload_time):
     log_with_color("32;1", f"[ACTOR] Detected new learner version {version}, reloading model from {args.weights_dir}...")
     reload_start = time.time()
 
-    # Free old model memory first to avoid OOM
+    # CRITICAL: Check memory BEFORE deleting old model
+    # Model needs ~8GB base + 2GB transfer overhead + 1GB buffer = ~11GB free
+    if device.type == 'cuda':
+        allocated = torch.cuda.memory_allocated(device)
+        total = torch.cuda.get_device_properties(device).total_memory
+        free_before = (total - allocated) / (1024**3)
+
+        required_for_reload = 11.0  # 8GB model + 2GB transfer + 1GB buffer
+        if free_before < required_for_reload:
+            logger.warning(
+                f"[ACTOR] Insufficient memory for safe reload ({free_before:.2f} GB free, need {required_for_reload:.2f} GB). "
+                f"Skipping reload to avoid OOM."
+            )
+            return model, last_reload_time  # Keep old model, skip reload
+
+        logger.info(f"[ACTOR] Memory check passed: {free_before:.2f} GB free (need {required_for_reload:.2f} GB), proceeding with reload")
+
+    # Free old model memory aggressively to avoid OOM
     log_with_color("32;1", f"[ACTOR] Freeing old model memory...")
+    old_model = model  # Keep reference in case we need to restore
     del model
+    gc.collect()  # Force Python garbage collection
+
     if device.type == 'cuda':
         torch.cuda.synchronize(device)  # Ensure deletion completes
         torch.cuda.empty_cache()
-        
+
         # Check available memory before reloading
-        free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        total = torch.cuda.get_device_properties(device).total_memory
+        free_memory = total - allocated
         free_memory_gb = free_memory / (1024**3)
-        log_with_color("32;1", f"[ACTOR] Free GPU memory: {free_memory_gb:.2f} GB")
-        
-        if free_memory_gb < 2.0:  # Need at least 2GB free
-            logger.warning(f"[ACTOR] Low GPU memory ({free_memory_gb:.2f} GB free), forcing cache clear...")
+        log_with_color("32;1", f"[ACTOR] GPU memory: {allocated/(1024**3):.2f} GB allocated, {reserved/(1024**3):.2f} GB reserved, {free_memory_gb:.2f} GB free")
+
+        # Aggressively free memory if low
+        if free_memory_gb < 3.0:  # Need at least 3GB free for safe reload
+            logger.warning(f"[ACTOR] Low GPU memory ({free_memory_gb:.2f} GB free), aggressively clearing cache...")
             torch.cuda.empty_cache()
             torch.cuda.synchronize(device)
-            free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+            gc.collect()  # Force another GC pass
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+
+            allocated = torch.cuda.memory_allocated(device)
+            free_memory = total - allocated
             free_memory_gb = free_memory / (1024**3)
-            logger.info(f"[ACTOR] After cache clear: {free_memory_gb:.2f} GB free")
-    
+            logger.info(f"[ACTOR] After aggressive cache clear: {free_memory_gb:.2f} GB free")
+
+            # If still low, wait a bit and retry
+            if free_memory_gb < 2.0:
+                logger.warning(f"[ACTOR] Still low memory ({free_memory_gb:.2f} GB), waiting 5s for other processes to free memory...")
+                time.sleep(5)
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize(device)
+                allocated = torch.cuda.memory_allocated(device)
+                free_memory = total - allocated
+                free_memory_gb = free_memory / (1024**3)
+                logger.info(f"[ACTOR] After wait: {free_memory_gb:.2f} GB free")
+
     # Reload base model to CPU first to avoid OOM
-    log_with_color("32;1", f"[ACTOR] Reloading base model...")
+    log_with_color("32;1", f"[ACTOR] Reloading base model to CPU...")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
-        device_map="cpu",  # Load to CPU first
+        device_map="cpu",  # Load to CPU first - safe, no GPU memory needed
     )
-    # Now move to device after ensuring old model is freed
+    log_with_color("32;1", f"[ACTOR] Base model loaded to CPU successfully")
+
+    # Now wait for GPU memory to be available before moving to GPU
     if device.type == 'cuda':
-        torch.cuda.empty_cache()  # Clear any remaining cache
-    base_model.to(device)
+        # Memory requirements for model reload:
+        # - Base model (4B params in bfloat16): ~8GB (4B * 2 bytes)
+        # - During .to(device) transfer: +2GB temporary overhead
+        # - LoRA adapter: ~100MB (small)
+        # - Safety buffer: +1GB
+        # Total needed: ~11GB free
+        model_size_gb = 8.0  # Base model size estimate
+        transfer_overhead_gb = 2.0  # Temporary memory during .to(device)
+        safety_buffer_gb = 1.0  # Safety margin
+        required_free_gb = model_size_gb + transfer_overhead_gb + safety_buffer_gb  # ~11GB total
+
+        max_wait_attempts = 10  # Wait up to 50 seconds total
+        wait_interval = 5  # Check every 5 seconds
+
+        for attempt in range(max_wait_attempts):
+            torch.cuda.empty_cache()  # Clear cache before checking
+            torch.cuda.synchronize(device)
+            gc.collect()  # Force garbage collection
+
+            allocated = torch.cuda.memory_allocated(device)
+            total = torch.cuda.get_device_properties(device).total_memory
+            free_memory_gb = (total - allocated) / (1024**3)
+
+            if free_memory_gb >= required_free_gb:
+                logger.info(f"[ACTOR] GPU memory available: {free_memory_gb:.2f} GB free (need {required_free_gb:.2f} GB). Moving model to GPU...")
+                break
+            else:
+                if attempt < max_wait_attempts - 1:
+                    logger.warning(
+                        f"[ACTOR] Waiting for GPU memory (attempt {attempt + 1}/{max_wait_attempts}): "
+                        f"{free_memory_gb:.2f} GB free, need {required_free_gb:.2f} GB. Waiting {wait_interval}s..."
+                    )
+                    time.sleep(wait_interval)
+                else:
+                    # Final attempt failed - give up and raise error
+                    logger.error(
+                        f"[ACTOR] Failed to get enough GPU memory after {max_wait_attempts} attempts. "
+                        f"Current: {free_memory_gb:.2f} GB free, need {required_free_gb:.2f} GB. "
+                        f"Model remains on CPU - this will cause issues. Consider reducing batch_size or increasing reload_every."
+                    )
+                    raise RuntimeError(
+                        f"Insufficient GPU memory for model reload: {free_memory_gb:.2f} GB free after waiting, "
+                        f"need {required_free_gb:.2f} GB. Model loaded to CPU but cannot move to GPU."
+                    )
+        
+        # Move base model to device with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                base_model.to(device)
+                log_with_color("32;1", f"[ACTOR] Base model moved to GPU successfully")
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and attempt < max_retries - 1:
+                    logger.warning(f"[ACTOR] OOM on GPU move attempt {attempt + 1}/{max_retries}, clearing cache and retrying...")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    time.sleep(2 * (attempt + 1))  # Exponential backoff
+                    
+                    # Re-check memory before retry
+                    allocated = torch.cuda.memory_allocated(device)
+                    free_memory_gb = (total - allocated) / (1024**3)
+                    logger.info(f"[ACTOR] After cleanup: {free_memory_gb:.2f} GB free")
+                else:
+                    raise
     log_with_color("32;1", f"[ACTOR] Base model reloaded")
 
     # Reload LoRA adapters from weights_dir (learner's latest checkpoint)
@@ -398,11 +504,29 @@ def main():
         if args.weights_dir and not generation_in_progress:
             # Additional safety check: ensure we have enough GPU memory before reloading
             if device.type == 'cuda':
-                free_memory_gb = (torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)) / (1024**3)
-                if free_memory_gb < 1.0:  # Need at least 1GB free to reload
-                    logger.warning(f"[Actor {actor_id} | Step {step}] Skipping model reload - low GPU memory ({free_memory_gb:.2f} GB free)")
+                allocated = torch.cuda.memory_allocated(device)
+                total = torch.cuda.get_device_properties(device).total_memory
+                free_memory_gb = (total - allocated) / (1024**3)
+                # Need at least 11GB free to safely reload (8GB model + 2GB transfer overhead + 1GB buffer)
+                required_for_reload = 11.0
+                if free_memory_gb < required_for_reload:
+                    logger.warning(
+                        f"[Actor {actor_id} | Step {step}] Skipping model reload - insufficient GPU memory "
+                        f"({free_memory_gb:.2f} GB free, need {required_for_reload:.2f} GB)"
+                    )
                 else:
-                    model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
+                    try:
+                        model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
+                    except RuntimeError as e:
+                        if "out of memory" in str(e).lower() or "Insufficient GPU memory" in str(e):
+                            logger.error(f"[Actor {actor_id} | Step {step}] Model reload failed due to OOM: {e}. Continuing with old model.")
+                            # Continue with old model - don't crash
+                        else:
+                            raise
+                    except Exception as e:
+                        # Catch any other errors during reload and continue with old model
+                        logger.error(f"[Actor {actor_id} | Step {step}] Model reload failed: {e}. Continuing with old model.")
+                        # Don't update last_reload_time so we'll retry next time
             else:
                 model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
 

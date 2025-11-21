@@ -143,12 +143,13 @@ def cleanup_old_checkpoints(output_dir: str, keep_last: int) -> None:
             step = int(m.group(1)) if m else -1
             entries.append((step, name))
 
-    # Sort by step number
+    # Sort by step number (ascending: oldest first)
     entries.sort(key=lambda x: x[0])
 
     if len(entries) <= keep_last:
         return
 
+    # Keep the last `keep_last` entries (highest step numbers)
     to_delete = entries[:-keep_last]
     for step, name in to_delete:
         path = os.path.join(output_dir, name)
@@ -265,6 +266,12 @@ def parse_args():
         default=None,
         help="Optional resume from LoRA checkpoint.",
     )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=5.0,
+        help="Maximum gradient norm for clipping. 0.0 = no clipping.",
+    )
 
     return parser.parse_args()
 
@@ -306,9 +313,21 @@ def main():
 
     # PEFT / LoRA
     if args.resume_dir is not None:
+        # Resolve to absolute path to avoid HuggingFace Hub confusion
+        resume_path = os.path.abspath(args.resume_dir)
+        if not os.path.exists(resume_path):
+            raise ValueError(
+                f"Resume directory does not exist: {resume_path}\n"
+                f"Please check the path or remove --resume_dir to start fresh training."
+            )
         if accelerator.is_main_process:
-            logger.info(f"Resuming LoRA from {args.resume_dir}")
-        model = PeftModel.from_pretrained(base_model, args.resume_dir)
+            logger.info(f"Resuming LoRA from {resume_path}")
+        # Use local_files_only=True to prevent PEFT from trying to download from HuggingFace Hub
+        model = PeftModel.from_pretrained(
+            base_model, 
+            resume_path,
+            local_files_only=True
+        )
         for name, p in model.named_parameters():
             if "lora_" in name:
                 p.requires_grad = True
@@ -359,16 +378,27 @@ def main():
 
     buffer = LocalReplayBuffer(replay_dir=args.replay_dir)
 
+    # Extract starting step from resume_dir if resuming
     global_step = 0
+    if args.resume_dir is not None:
+        # Extract step number from resume_dir path (e.g., "output/step-250" -> 250)
+        step_match = re.search(r"step-(\d+)", args.resume_dir)
+        if step_match:
+            global_step = int(step_match.group(1))
+            if accelerator.is_main_process:
+                logger.info(f"Resuming from step {global_step}")
+        else:
+            if accelerator.is_main_process:
+                logger.warning(f"Could not extract step number from resume_dir {args.resume_dir}, starting from step 0")
 
     if accelerator.is_main_process:
-        log_with_color("32;1", "[LEARNER] Entering training loop...")
+        log_with_color("32;1", f"[LEARNER] Entering training loop... Starting from step {global_step}")
 
     while global_step < args.total_steps:
         # 1) Sample groups from replay buffer
         groups: List[Dict[str, Any]] = buffer.sample_batch_groups(
             batch_groups=args.batch_groups,
-            timeout=5,
+            timeout=20,
         )
         if len(groups) == 0:
             if accelerator.is_main_process:
@@ -451,14 +481,23 @@ def main():
 
             accelerator.backward(loss)
 
+            # Compute and clip gradient norm
             grad_norm = None
             try:
-                total_norm_sq = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        pn = p.grad.data.norm(2)
-                        total_norm_sq += pn.item() ** 2
-                grad_norm = (total_norm_sq ** 0.5) if total_norm_sq > 0 else 0.0
+                if args.max_grad_norm > 0.0:
+                    # Clip gradients - use unwrapped model for distributed training
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        accelerator.unwrap_model(model).parameters(), 
+                        args.max_grad_norm
+                    )
+                else:
+                    # Just compute norm without clipping
+                    total_norm_sq = 0.0
+                    for p in accelerator.unwrap_model(model).parameters():
+                        if p.grad is not None:
+                            pn = p.grad.data.norm(2)
+                            total_norm_sq += pn.item() ** 2
+                    grad_norm = (total_norm_sq ** 0.5) if total_norm_sq > 0 else 0.0
             except Exception:
                 pass
 
