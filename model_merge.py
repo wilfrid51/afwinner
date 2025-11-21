@@ -25,9 +25,9 @@ def main():
     # baseModelPath = ask("Enter the path to the base HF model (folder or .bin): ")
     baseModelPath = "caphe/Affine_top1"
     # loraCheckpointPath = ask("Enter the path to the LoRA checkpoint: ")
-    loraCheckpointPath = "AL/output/step-600"
+    loraCheckpointPath = "AL/output/step-500"
     # outputPath = ask("Enter the output folder (for merged model): ")
-    outputPath = "merged_model"
+    outputPath = "merged_model-50"
 
     check_python_dependencies()
 
