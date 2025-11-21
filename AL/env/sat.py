@@ -48,7 +48,7 @@ class SATTask:
         """Evaluate SAT response"""
         cls = challenge.extra.get("clauses", [])
 
-        print("[SAT Evaluating...]")
+        # print("[SAT Evaluating...]")
 
         got = {
             int(v): val.lower() in ("true", "1")
@@ -57,5 +57,5 @@ class SATTask:
         
         ok = all(any((lit > 0) == got.get(abs(lit), None) for lit in c) for c in cls)
         # print(f"[SAT] Got: {got}, Expected: {challenge.extra.get('solution', {})}")
-        print(f"[SAT SCORE] {float(ok)} ({ok})")
+        # print(f"[SAT SCORE] {float(ok)} ({ok})")
         return float(ok)

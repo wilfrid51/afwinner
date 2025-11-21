@@ -78,7 +78,7 @@ class DEDTask:
     async def evaluate(self, response: str, challenge: Challenge) -> float:
         """Evaluate program against test cases"""
         logger.debug("Evaluating DED response")
-        print("[DED Evaluating...]")
+        # print("[DED Evaluating...]")
         
         sample = challenge.extra.get("sample", {})
         
@@ -176,6 +176,6 @@ class DEDTask:
         # print(f"{'*'*30} OUTPUT {'*'*30}")
         # print(f"{response}")
         # print(f"{'-'*30} {'-'*30}")
-        print(f"[DED SCORE] {score:8.4f} ({passed}/{total})")
+        # print(f"[DED SCORE] {score:8.4f} ({passed}/{total})")
 
         return score

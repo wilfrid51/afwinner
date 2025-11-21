@@ -262,12 +262,36 @@ def maybe_reload_model(model, tokenizer, args, device, last_reload_time):
     log_with_color("32;1", f"[ACTOR] Detected new learner version {version}, reloading model from {args.weights_dir}...")
     reload_start = time.time()
 
-    # Reload base model
+    # Free old model memory first to avoid OOM
+    log_with_color("32;1", f"[ACTOR] Freeing old model memory...")
+    del model
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)  # Ensure deletion completes
+        torch.cuda.empty_cache()
+        
+        # Check available memory before reloading
+        free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+        free_memory_gb = free_memory / (1024**3)
+        log_with_color("32;1", f"[ACTOR] Free GPU memory: {free_memory_gb:.2f} GB")
+        
+        if free_memory_gb < 2.0:  # Need at least 2GB free
+            logger.warning(f"[ACTOR] Low GPU memory ({free_memory_gb:.2f} GB free), forcing cache clear...")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(device)
+            free_memory = torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)
+            free_memory_gb = free_memory / (1024**3)
+            logger.info(f"[ACTOR] After cache clear: {free_memory_gb:.2f} GB free")
+    
+    # Reload base model to CPU first to avoid OOM
     log_with_color("32;1", f"[ACTOR] Reloading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
+        device_map="cpu",  # Load to CPU first
     )
+    # Now move to device after ensuring old model is freed
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()  # Clear any remaining cache
     base_model.to(device)
     log_with_color("32;1", f"[ACTOR] Base model reloaded")
 
@@ -364,13 +388,23 @@ def main():
     logger.info("=" * 80)
 
     step = 0
+    generation_in_progress = False
     while True:
         step += 1
         step_start_time = time.time()
 
         # Optionally reload weights if learner updated them
-        if args.weights_dir:
-            model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
+        # CRITICAL: Only reload when NOT generating/evaluating to avoid OOM
+        if args.weights_dir and not generation_in_progress:
+            # Additional safety check: ensure we have enough GPU memory before reloading
+            if device.type == 'cuda':
+                free_memory_gb = (torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)) / (1024**3)
+                if free_memory_gb < 1.0:  # Need at least 1GB free to reload
+                    logger.warning(f"[Actor {actor_id} | Step {step}] Skipping model reload - low GPU memory ({free_memory_gb:.2f} GB free)")
+                else:
+                    model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
+            else:
+                model, last_reload_time = maybe_reload_model(model, tokenizer, args, device, last_reload_time)
 
         log_with_color("32;1", f"[ACTOR {actor_id}] Model is loaded and ready to use")
 
@@ -431,35 +465,63 @@ def main():
         tokenize_time = time.time() - tokenize_start
 
         prompt_tokens = input_ids.numel()
-        logger.debug(
+        logger.info(
             f"[Actor {actor_id} | Step {step}] Tokenized: {prompt_tokens} total tokens, "
-            f"avg {prompt_tokens // len(prompts)} per prompt ({tokenize_time:.3f}s)"
+            f"avg {prompt_tokens // len(prompts)} per prompt ({tokenize_time:.3f}s), "
+            f"input_ids device={input_ids.device}, model device={next(model.parameters()).device}"
         )
 
         # Repeat prompts group_size times for generation
         input_ids_rep = input_ids.repeat_interleave(group_size, dim=0)
         attention_mask_rep = attention_mask.repeat_interleave(group_size, dim=0)
         total_sequences = input_ids_rep.shape[0]
-        logger.debug(
+        logger.info(
             f"[Actor {actor_id} | Step {step}] Expanded to {total_sequences} sequences "
-            f"(batch_size={batch_size} × group_size={group_size})"
+            f"(batch_size={batch_size} × group_size={group_size}), shapes: input_ids={input_ids_rep.shape}, attn_mask={attention_mask_rep.shape}"
         )
 
         # 3) Generate sequences
         gen_start = time.time()
-        with torch.no_grad():
-            sequences = model.generate(
-                input_ids=input_ids_rep,
-                attention_mask=attention_mask_rep,
-                max_new_tokens=args.max_completion_length,
-                min_new_tokens=1,
-                do_sample=not args.no_sampling,
-                temperature=0.7,
-                top_p=0.95,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+        log_with_color("33;1", f"[Actor {actor_id} | Step {step}] Starting generation: {total_sequences} sequences, device={device}")
+        
+        # Mark generation as in progress to prevent model reload during generation
+        generation_in_progress = True
+        
+        # Ensure CUDA is synchronized before generation to avoid hangs
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+            log_with_color("33;1", f"[Actor {actor_id} | Step {step}] CUDA synchronized, starting model.generate()...")
+        
+        try:
+            with torch.no_grad():
+                sequences = model.generate(
+                    input_ids=input_ids_rep,
+                    attention_mask=attention_mask_rep,
+                    max_new_tokens=args.max_completion_length,
+                    min_new_tokens=1,
+                    do_sample=not args.no_sampling,
+                    temperature=0.7,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error(f"[Actor {actor_id} | Step {step}] CUDA OOM during generation! Clearing cache...")
+                torch.cuda.empty_cache()
+                raise
+            else:
+                logger.error(f"[Actor {actor_id} | Step {step}] RuntimeError during generation: {e}", exc_info=True)
+                raise
+        except Exception as e:
+            logger.error(f"[Actor {actor_id} | Step {step}] Generation failed: {e}", exc_info=True)
+            generation_in_progress = False  # Clear flag on error
+            raise
+        
         gen_time = time.time() - gen_start
+        log_with_color("33;1", f"[Actor {actor_id} | Step {step}] Generation completed in {gen_time:.2f}s")
+        
+        # Keep flag True during evaluation - model reload should wait until entire step completes
 
         generated_tokens = sequences.numel() - input_ids_rep.numel()
         tokens_per_sec = generated_tokens / gen_time if gen_time > 0 else 0
@@ -535,6 +597,9 @@ def main():
 
         eval_time = time.time() - eval_start
         step_time = time.time() - step_start_time
+
+        # Clear generation flag AFTER evaluation completes - now safe to reload model
+        generation_in_progress = False
 
         # Update totals
         total_prompts += batch_size
