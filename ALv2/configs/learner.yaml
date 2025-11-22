@@ -1,0 +1,12 @@
+# file: configs/learner.yaml
+model_name: your-hf-user/strong-base-model
+replay_dir: replay
+output_dir: output
+batch_size: 64
+total_steps: 2000
+lr: 5e-5
+lambda_bc: 0.1
+lora_r: 64
+lora_alpha: 16
+lora_dropout: 0.05
+save_interval: 200

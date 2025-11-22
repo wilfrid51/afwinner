@@ -1,0 +1,16 @@
+# file: configs/tasks.yaml
+affine:
+  sat: {}
+  abd: {}
+  ded: {}
+agentevol_offline:
+  data_root: data/agentevol
+  envs:
+    - webshop
+    - alfworld
+    - babyai
+    - sciworld
+    - textcraft
+agentevol_online:
+  base_url: http://localhost:8000
+  envs: []

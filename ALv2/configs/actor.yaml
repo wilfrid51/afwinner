@@ -1,0 +1,9 @@
+# file: configs/actor.yaml
+model_name: your-hf-user/strong-base-model
+adapter_path: null
+tasks_config: configs/tasks.yaml
+replay_dir: replay
+max_steps_per_episode: 32
+temperature: 0.7
+max_new_tokens: 256
+schedule: round_robin

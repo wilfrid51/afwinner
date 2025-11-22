@@ -4,7 +4,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 logger = logging.getLogger(__name__)
@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 class AgentEvolTask:
     """
     Offline task wrapper that replays pre-recorded expert trajectories
-    (e.g. AgentGym datasets such as WebShop or ALFWorld) inside the
-    standard RL training loop.
+    (e.g. AgentGym datasets such as WebShop, ALFWorld, BabyAI, SciWorld, TextCraft)
+    inside a standard RL training loop.
     """
 
     def __init__(
@@ -29,12 +29,12 @@ class AgentEvolTask:
     ) -> None:
         """
         Args:
-            env_name: Identifier of the underlying environment (e.g. "webshop").
+            env_name: Name of the AgentGym task or underlying environment.
             data_path: Path to JSON/JSONL file(s) or directory containing trajectories.
-            trajectories: Optional in-memory trajectories (overrides `data_path`).
-            eval_split: Fraction of trajectories set aside for evaluation.
-            seed: RNG seed for trajectory sampling.
-            warn_on_action_mismatch: Whether to log when agent and expert actions differ.
+            trajectories: Optional in-memory trajectories (used instead of reading from disk).
+            eval_split: Fraction of trajectories held out for evaluation.
+            seed: Random seed used for sampling trajectories.
+            warn_on_action_mismatch: Whether to log discrepancies between agent and expert actions.
         """
         self.env_name = env_name
         self.warn_on_action_mismatch = warn_on_action_mismatch
@@ -46,7 +46,7 @@ class AgentEvolTask:
             else self._load_from_path(data_path)
         )
         if not loaded:
-            raise ValueError("No trajectories available for AgentEvolTask.")
+            raise ValueError("AgentEvolTask requires at least one trajectory.")
 
         split_idx = int(len(loaded) * (1 - eval_split))
         if split_idx <= 0:
@@ -217,7 +217,11 @@ class AgentEvolTask:
                     logger.warning("Failed to parse %s: %s", file_path, exc)
                     return data
             if isinstance(payload, list):
-                data.extend([dict(step) for step in traj] for traj in payload if isinstance(traj, list))
+                data.extend(
+                    [dict(step) for step in traj]
+                    for traj in payload
+                    if isinstance(traj, list)
+                )
             elif isinstance(payload, dict):
                 steps = payload.get("steps") or payload.get("trajectory")
                 if isinstance(steps, list):
